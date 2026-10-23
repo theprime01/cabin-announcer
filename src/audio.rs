@@ -1,40 +1,57 @@
-//! Speech and playback. Announcements queue up and play one after another on
-//! a dedicated thread, so a long safety demo never cuts off a later call.
+//! Playback on a dedicated thread. Announcements queue up and play one after
+//! another; boarding music and cabin ambience loop underneath, ducking while
+//! someone is speaking. Everything passes through a filter that muffles the
+//! sound when you're on the flight deck.
 
 use std::collections::VecDeque;
-use std::io::{BufReader, Cursor};
+use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rodio::buffer::SamplesBuffer;
-use rodio::{OutputStream, Sink, Source};
+use rodio::{OutputStream, OutputStreamHandle, Sink, Source};
 
-use crate::announcements::Role;
-use crate::config::Voice;
+use crate::config::Sound;
 
+#[derive(Clone)]
 pub struct Item {
     pub title: String,
-    pub role: Role,
-    pub text: String,
-    pub chime: bool,
-    /// Recordings played in order instead of speech; empty means speak.
+    /// Played in order.
     pub recordings: Vec<PathBuf>,
-    pub voice: Voice,
+    /// Add the app's PA chime first.
+    pub chime: bool,
+}
+
+/// Which camera you're looking through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum View {
+    #[default]
+    Cabin,
+    Cockpit,
+    Outside,
 }
 
 enum Msg {
     Play(Item),
+    Replay,
     Stop,
     Pause(bool),
+    /// Tracks to loop; empty stops (fading out).
+    Music(Vec<PathBuf>),
+    Ambience(Vec<PathBuf>),
+    Settings(Sound),
+    View(View),
 }
 
 #[derive(Default, Clone)]
 pub struct Status {
     pub now_playing: Option<String>,
     pub queued: Vec<String>,
-    pub voices: Vec<String>,
+    pub music: Option<String>,
+    pub paused: bool,
     pub error: Option<String>,
 }
 
@@ -45,100 +62,144 @@ pub struct Audio {
 }
 
 impl Audio {
-    pub fn start() -> Audio {
+    pub fn start(sound: Sound) -> Audio {
         let (tx, rx) = channel();
         let status = Arc::new(Mutex::new(Status::default()));
         let s = status.clone();
         std::thread::Builder::new()
             .name("audio".into())
-            .spawn(move || run(rx, s))
+            .spawn(move || run(rx, s, sound))
             .expect("spawn audio thread");
         Audio { tx, status }
     }
 
+    fn send(&self, m: Msg) {
+        let _ = self.tx.send(m);
+    }
+
     pub fn play(&self, item: Item) {
-        let _ = self.tx.send(Msg::Play(item));
+        self.send(Msg::Play(item));
+    }
+
+    /// Plays the last announcement again.
+    pub fn replay(&self) {
+        self.send(Msg::Replay);
     }
 
     /// Stops the current announcement and clears the queue.
     pub fn stop(&self) {
-        let _ = self.tx.send(Msg::Stop);
+        self.send(Msg::Stop);
     }
 
     pub fn pause(&self, paused: bool) {
-        let _ = self.tx.send(Msg::Pause(paused));
+        self.send(Msg::Pause(paused));
+    }
+
+    pub fn toggle_pause(&self) {
+        let paused = self.status.lock().unwrap().paused;
+        self.pause(!paused);
+    }
+
+    pub fn music(&self, tracks: Vec<PathBuf>) {
+        self.send(Msg::Music(tracks));
+    }
+
+    pub fn ambience(&self, tracks: Vec<PathBuf>) {
+        self.send(Msg::Ambience(tracks));
+    }
+
+    pub fn settings(&self, sound: Sound) {
+        self.send(Msg::Settings(sound));
+    }
+
+    pub fn view(&self, view: View) {
+        self.send(Msg::View(view));
     }
 }
 
-struct Speaker {
-    synth: windows::Media::SpeechSynthesis::SpeechSynthesizer,
-    voices: Vec<windows::Media::SpeechSynthesis::VoiceInformation>,
+/// The live cockpit filter settings, shared with every playing sound.
+#[derive(Default)]
+struct Muffle {
+    /// Low-pass cutoff in Hz (f32 bits); 0 means open.
+    cutoff: AtomicU32,
+    /// Gain (f32 bits).
+    gain: AtomicU32,
 }
 
-impl Speaker {
-    fn new() -> windows::core::Result<Speaker> {
-        use windows::Media::SpeechSynthesis::SpeechSynthesizer;
-        unsafe {
-            // Already initialised is fine; anything else surfaces below.
-            let _ = windows::Win32::System::WinRT::RoInitialize(windows::Win32::System::WinRT::RO_INIT_MULTITHREADED);
+impl Muffle {
+    fn set(&self, cutoff: f32, gain: f32) {
+        self.cutoff.store(cutoff.to_bits(), Ordering::Relaxed);
+        self.gain.store(gain.to_bits(), Ordering::Relaxed);
+    }
+    fn get(&self) -> (f32, f32) {
+        (f32::from_bits(self.cutoff.load(Ordering::Relaxed)), f32::from_bits(self.gain.load(Ordering::Relaxed)))
+    }
+}
+
+const MUFFLED_HZ: f32 = 900.0;
+
+/// Applies the shared muffle: a two-pole low-pass and a gain, both eased so
+/// switching cameras doesn't click.
+struct Muffled<S> {
+    inner: S,
+    muffle: Arc<Muffle>,
+    rate: u32,
+    channels: u16,
+    channel: usize,
+    state: Vec<[f32; 2]>,
+    coef: f32,
+    gain: f32,
+    counter: u32,
+}
+
+impl<S: Source<Item = f32>> Muffled<S> {
+    fn new(inner: S, muffle: Arc<Muffle>) -> Self {
+        let (rate, channels) = (inner.sample_rate(), inner.channels());
+        let (cutoff, gain) = muffle.get();
+        let coef = coefficient(cutoff, rate);
+        Muffled { inner, muffle, rate, channels, channel: 0, state: vec![[0.0; 2]; channels.max(1) as usize], coef, gain, counter: 0 }
+    }
+}
+
+/// One-pole low-pass coefficient; 1.0 passes everything.
+fn coefficient(cutoff: f32, rate: u32) -> f32 {
+    if cutoff <= 0.0 { 1.0 } else { 1.0 - (-2.0 * std::f32::consts::PI * cutoff / rate as f32).exp() }
+}
+
+impl<S: Source<Item = f32>> Iterator for Muffled<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        let x = self.inner.next()?;
+        // Re-read the settings every few milliseconds, easing towards them.
+        if self.counter == 0 {
+            let (cutoff, gain) = self.muffle.get();
+            self.coef += (coefficient(cutoff, self.rate) - self.coef) * 0.2;
+            self.gain += (gain - self.gain) * 0.2;
         }
-        let synth = SpeechSynthesizer::new()?;
-        let voices = SpeechSynthesizer::AllVoices()?.into_iter().collect();
-        Ok(Speaker { synth, voices })
-    }
-
-    fn names(&self) -> Vec<String> {
-        self.voices.iter().filter_map(|v| v.DisplayName().ok()).map(|n| n.to_string()).collect()
-    }
-
-    /// The named voice, else the first one whose voice gender suits the role.
-    fn pick(&self, name: &str, role: Role) -> Option<&windows::Media::SpeechSynthesis::VoiceInformation> {
-        use windows::Media::SpeechSynthesis::VoiceGender;
-        let by_name = self.voices.iter().find(|v| v.DisplayName().is_ok_and(|n| n.to_string() == name));
-        let wanted = if role == Role::Captain { VoiceGender::Male } else { VoiceGender::Female };
-        by_name
-            .or_else(|| self.voices.iter().find(|v| v.Gender().is_ok_and(|g| g == wanted)))
-            .or(self.voices.first())
-    }
-
-    /// Returns mono samples and their sample rate.
-    fn speak(&self, text: &str, role: Role, voice: &Voice) -> Result<(Vec<f32>, u32), String> {
-        let wav = (|| -> windows::core::Result<Vec<u8>> {
-            use windows::Storage::Streams::DataReader;
-            let name = if role == Role::Captain { &voice.captain_voice } else { &voice.purser_voice };
-            if let Some(v) = self.pick(name, role) {
-                self.synth.SetVoice(v)?;
-            }
-            self.synth.Options()?.SetSpeakingRate(voice.rate.clamp(0.5, 2.0))?;
-            let stream = self.synth.SynthesizeTextToStreamAsync(&windows::core::HSTRING::from(text))?.get()?;
-            let size = stream.Size()? as u32;
-            let reader = DataReader::CreateDataReader(&stream.GetInputStreamAt(0)?)?;
-            reader.LoadAsync(size)?.get()?;
-            let mut buf = vec![0u8; size as usize];
-            reader.ReadBytes(&mut buf)?;
-            Ok(buf)
-        })()
-        .map_err(|e| format!("speech: {e}"))?;
-        decode_wav(&wav)
+        self.counter = (self.counter + 1) % 256;
+        let st = &mut self.state[self.channel];
+        st[0] += self.coef * (x - st[0]);
+        st[1] += self.coef * (st[0] - st[1]);
+        let y = st[1] * self.gain;
+        self.channel = (self.channel + 1) % self.channels.max(1) as usize;
+        Some(y)
     }
 }
 
-fn decode_wav(bytes: &[u8]) -> Result<(Vec<f32>, u32), String> {
-    let mut r = hound::WavReader::new(Cursor::new(bytes)).map_err(|e| format!("speech audio: {e}"))?;
-    let spec = r.spec();
-    let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => r.samples::<f32>().filter_map(Result::ok).collect(),
-        hound::SampleFormat::Int => {
-            let scale = (1i64 << (spec.bits_per_sample - 1)) as f32;
-            r.samples::<i32>().filter_map(Result::ok).map(|s| s as f32 / scale).collect()
-        }
-    };
-    Ok((to_mono(&interleaved, spec.channels), spec.sample_rate))
-}
-
-fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
-    let n = channels.max(1) as usize;
-    samples.chunks(n).map(|c| c.iter().sum::<f32>() / n as f32).collect()
+impl<S: Source<Item = f32>> Source for Muffled<S> {
+    fn current_frame_len(&self) -> Option<usize> {
+        self.inner.current_frame_len()
+    }
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+    fn sample_rate(&self) -> u32 {
+        self.rate
+    }
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
 }
 
 /// RBJ biquad filter.
@@ -160,12 +221,7 @@ impl Biquad {
             ((1.0 - cos) / 2.0, 1.0 - cos, (1.0 - cos) / 2.0)
         };
         let a0 = 1.0 + alpha;
-        Biquad {
-            b: [b0 / a0, b1 / a0, b2 / a0],
-            a: [-2.0 * cos / a0, (1.0 - alpha) / a0],
-            x: [0.0; 2],
-            y: [0.0; 2],
-        }
+        Biquad { b: [b0 / a0, b1 / a0, b2 / a0], a: [-2.0 * cos / a0, (1.0 - alpha) / a0], x: [0.0; 2], y: [0.0; 2] }
     }
 
     fn run(&mut self, x: f32) -> f32 {
@@ -176,15 +232,10 @@ impl Biquad {
     }
 }
 
-/// Makes clean speech sound like it comes through small cabin speakers:
-/// band-limited, slightly driven, with a short reflection off the cabin walls.
+/// Makes a clean studio recording sound like it comes through small cabin
+/// speakers: band-limited, slightly driven, with a short cabin reflection.
 pub fn pa_effect(samples: &[f32], rate: u32) -> Vec<f32> {
-    let mut filters = [
-        Biquad::new('h', 320.0, rate),
-        Biquad::new('h', 320.0, rate),
-        Biquad::new('l', 3400.0, rate),
-        Biquad::new('l', 3400.0, rate),
-    ];
+    let mut filters = [Biquad::new('h', 320.0, rate), Biquad::new('h', 320.0, rate), Biquad::new('l', 3400.0, rate), Biquad::new('l', 3400.0, rate)];
     let drive = 2.2f32;
     let norm = drive.tanh();
     let mut out: Vec<f32> = samples
@@ -194,9 +245,8 @@ pub fn pa_effect(samples: &[f32], rate: u32) -> Vec<f32> {
             (f * drive).tanh() / norm
         })
         .collect();
-    let taps = [(0.011, 0.22f32), (0.019, 0.14), (0.031, 0.08)];
     let dry = out.clone();
-    for (secs, gain) in taps {
+    for (secs, gain) in [(0.011, 0.22f32), (0.019, 0.14), (0.031, 0.08)] {
         let d = (secs * rate as f64) as usize;
         for i in d..out.len() {
             out[i] += dry[i - d] * gain;
@@ -214,12 +264,11 @@ fn normalize(samples: &mut [f32], peak: f32) {
     }
 }
 
-/// A two-tone "hi-lo" cabin chime, synthesised (no sampled audio).
+/// A two-tone "hi-lo" cabin chime, for recordings that don't have their own.
 pub fn chime(rate: u32) -> Vec<f32> {
     let len = (rate as f32 * 2.2) as usize;
     let mut out = vec![0.0f32; len];
-    let notes = [(0.0f32, 1046.5f32), (0.42, 784.0)];
-    for (start, freq) in notes {
+    for (start, freq) in [(0.0f32, 1046.5f32), (0.42, 784.0)] {
         let first = (start * rate as f32) as usize;
         for (i, s) in out.iter_mut().enumerate().skip(first) {
             let t = (i - first) as f32 / rate as f32;
@@ -232,129 +281,200 @@ pub fn chime(rate: u32) -> Vec<f32> {
     out
 }
 
-fn silence(rate: u32, secs: f32) -> Vec<f32> {
-    vec![0.0; (rate as f32 * secs) as usize]
+fn to_mono(samples: &[f32], channels: u16) -> Vec<f32> {
+    let n = channels.max(1) as usize;
+    samples.chunks(n).map(|c| c.iter().sum::<f32>() / n as f32).collect()
 }
 
-fn load_recording(path: &PathBuf, voice: &Voice) -> Result<SamplesBuffer<f32>, String> {
+type Decoded = rodio::source::SamplesConverter<rodio::Decoder<BufReader<std::fs::File>>, f32>;
+
+fn open(path: &PathBuf) -> Result<Decoded, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let dec = rodio::Decoder::new(BufReader::new(file)).map_err(|e| format!("{}: {e}", path.display()))?;
-    let (channels, rate) = (dec.channels(), dec.sample_rate());
-    let samples: Vec<f32> = dec.convert_samples::<f32>().collect();
-    Ok(if voice.pa_effect_on_recordings {
-        SamplesBuffer::new(1, rate, pa_effect(&to_mono(&samples, channels), rate))
-    } else {
-        SamplesBuffer::new(channels, rate, samples)
-    })
+    Ok(dec.convert_samples::<f32>())
+}
+
+fn file_title(path: &PathBuf) -> String {
+    path.file_stem().map_or(String::new(), |s| s.to_string_lossy().to_string())
+}
+
+/// One looping background layer (music or ambience).
+struct Layer {
+    sink: Sink,
+    tracks: Vec<PathBuf>,
+    /// Current volume, eased towards the target.
+    level: f32,
+    now: Option<String>,
+}
+
+impl Layer {
+    fn new(handle: &OutputStreamHandle) -> Option<Layer> {
+        let sink = Sink::try_new(handle).ok()?;
+        sink.set_volume(0.0);
+        Some(Layer { sink, tracks: Vec::new(), level: 0.0, now: None })
+    }
+
+    /// Keeps a track queued while wanted, and fades towards `target`.
+    fn tick(&mut self, target: f32, muffle: &Arc<Muffle>, errors: &mut Option<String>) {
+        let wanted = !self.tracks.is_empty();
+        if wanted && self.sink.empty() {
+            let path = crate::packs::pick(&self.tracks);
+            match open(&path) {
+                Ok(src) => {
+                    self.sink.append(Muffled::new(src, muffle.clone()));
+                    self.now = Some(file_title(&path));
+                }
+                Err(e) => *errors = Some(e),
+            }
+        }
+        let target = if wanted { target } else { 0.0 };
+        // About a two-second fade at 20 ticks a second.
+        let step = 0.025f32.max((target - self.level).abs() * 0.08);
+        self.level = if self.level < target { (self.level + step).min(target) } else { (self.level - step).max(target) };
+        self.sink.set_volume(self.level);
+        if !wanted && self.level <= 0.0 && !self.sink.empty() {
+            self.sink.clear();
+            self.sink.play();
+            self.now = None;
+        }
+    }
 }
 
 /// Builds everything the sink plays for one announcement.
-fn render(item: &Item, speaker: Option<&Speaker>) -> Result<Vec<SamplesBuffer<f32>>, String> {
+fn build(item: &Item, sound: &Sound, muffle: &Arc<Muffle>, sink: &Sink) -> Result<(), String> {
     const CHIME_RATE: u32 = 44_100;
-    let mut parts = Vec::new();
-    if item.chime && item.voice.chime {
-        let c = chime(CHIME_RATE);
-        let c = if item.voice.pa_effect { pa_effect(&c, CHIME_RATE).iter().map(|s| s * 0.65).collect() } else { c };
-        parts.push(SamplesBuffer::new(1, CHIME_RATE, c));
-        parts.push(SamplesBuffer::new(1, CHIME_RATE, silence(CHIME_RATE, 0.4)));
+    if item.chime {
+        let mut c = chime(CHIME_RATE);
+        c.extend(vec![0.0; (CHIME_RATE as f32 * 0.4) as usize]);
+        sink.append(Muffled::new(SamplesBuffer::new(1, CHIME_RATE, c), muffle.clone()));
     }
-    if !item.recordings.is_empty() {
-        for (i, path) in item.recordings.iter().enumerate() {
-            if i > 0 {
-                parts.push(SamplesBuffer::new(1, CHIME_RATE, silence(CHIME_RATE, 0.6)));
-            }
-            parts.push(load_recording(path, &item.voice)?);
+    for (i, path) in item.recordings.iter().enumerate() {
+        if i > 0 {
+            sink.append(Muffled::new(SamplesBuffer::new(1, CHIME_RATE, vec![0.0; (CHIME_RATE as f32 * 0.6) as usize]), muffle.clone()));
         }
-    } else {
-        let speaker = speaker.ok_or("Windows speech isn't available")?;
-        let (speech, rate) = speaker.speak(&item.text, item.role, &item.voice)?;
-        let speech = if item.voice.pa_effect { pa_effect(&speech, rate) } else { speech };
-        parts.push(SamplesBuffer::new(1, rate, speech));
+        let src = open(path)?;
+        if sound.pa_effect {
+            let (channels, rate) = (src.channels(), src.sample_rate());
+            let samples: Vec<f32> = src.collect();
+            let wet = pa_effect(&to_mono(&samples, channels), rate);
+            sink.append(Muffled::new(SamplesBuffer::new(1, rate, wet), muffle.clone()));
+        } else {
+            sink.append(Muffled::new(src, muffle.clone()));
+        }
     }
-    Ok(parts)
+    Ok(())
 }
 
-fn run(rx: Receiver<Msg>, status: Arc<Mutex<Status>>) {
-    let set = |f: &dyn Fn(&mut Status)| f(&mut status.lock().unwrap());
-    let speaker = match Speaker::new() {
-        Ok(s) => {
-            let names = s.names();
-            set(&|st| st.voices = names.clone());
-            Some(s)
-        }
-        Err(e) => {
-            let msg = format!("Windows speech isn't available: {e}");
-            set(&|st| st.error = Some(msg.clone()));
-            None
-        }
-    };
-    let output = OutputStream::try_default();
-    let (_stream, handle) = match output {
+fn apply_view(muffle: &Muffle, view: View, sound: &Sound) {
+    match view {
+        View::Cabin => muffle.set(0.0, 1.0),
+        View::Cockpit => muffle.set(if sound.cockpit_muffle { MUFFLED_HZ } else { 0.0 }, sound.cockpit_volume),
+        View::Outside => muffle.set(MUFFLED_HZ, sound.outside_volume),
+    }
+}
+
+fn run(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, mut sound: Sound) {
+    let set = |f: &mut dyn FnMut(&mut Status)| f(&mut status.lock().unwrap());
+    let (_stream, handle) = match OutputStream::try_default() {
         Ok(o) => o,
         Err(e) => {
             let msg = format!("No audio output: {e}");
-            set(&|st| st.error = Some(msg.clone()));
+            set(&mut |st| st.error = Some(msg.clone()));
             return;
         }
     };
+    let muffle = Arc::new(Muffle::default());
+    let mut view = View::Cabin;
+    apply_view(&muffle, view, &sound);
+    let (Ok(speech), Some(mut music), Some(mut ambience)) = (Sink::try_new(&handle), Layer::new(&handle), Layer::new(&handle)) else {
+        set(&mut |st| st.error = Some("Couldn't open the audio device".into()));
+        return;
+    };
 
     let mut queue: VecDeque<Item> = VecDeque::new();
+    let mut last: Option<Item> = None;
+    let mut playing: Option<String> = None;
+    let mut gap_until = Instant::now();
     let mut paused = false;
     loop {
+        match rx.recv_timeout(Duration::from_millis(50)) {
+            Ok(Msg::Play(i)) => queue.push_back(i),
+            Ok(Msg::Replay) => {
+                if let Some(i) = last.clone() {
+                    queue.push_front(i);
+                }
+            }
+            Ok(Msg::Stop) => {
+                queue.clear();
+                speech.clear();
+                speech.play();
+                if paused {
+                    speech.pause();
+                }
+            }
+            Ok(Msg::Pause(p)) => {
+                paused = p;
+                for s in [&speech, &music.sink, &ambience.sink] {
+                    if p { s.pause() } else { s.play() }
+                }
+                set(&mut |st| st.paused = p);
+            }
+            Ok(Msg::Music(t)) => music.tracks = t,
+            Ok(Msg::Ambience(t)) => ambience.tracks = t,
+            Ok(Msg::Settings(s)) => {
+                sound = s;
+                apply_view(&muffle, view, &sound);
+            }
+            Ok(Msg::View(v)) => {
+                view = v;
+                apply_view(&muffle, view, &sound);
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+
+        let mut error = None;
+        if speech.empty() && playing.take().is_some() {
+            // A short gap between back-to-back announcements.
+            gap_until = Instant::now() + Duration::from_millis(800);
+        }
+        if speech.empty() && !paused && Instant::now() >= gap_until {
+            if let Some(item) = queue.pop_front() {
+                speech.set_volume(sound.volume.clamp(0.0, 1.0));
+                match build(&item, &sound, &muffle, &speech) {
+                    Ok(()) => {
+                        playing = Some(item.title.clone());
+                        last = Some(item);
+                    }
+                    Err(e) => {
+                        speech.clear();
+                        speech.play();
+                        error = Some(e);
+                    }
+                }
+            }
+        }
+        // Background sound dips under announcements.
+        let duck = if speech.empty() { 1.0 } else { 0.25 };
+        let music_target = if sound.music { sound.music_volume * duck } else { 0.0 };
+        let ambience_target = if sound.ambience { sound.ambience_volume * duck.max(0.6) } else { 0.0 };
+        if !paused {
+            music.tick(music_target, &muffle, &mut error);
+            ambience.tick(ambience_target, &muffle, &mut error);
+        }
+
         let titles: Vec<String> = queue.iter().map(|i| i.title.clone()).collect();
-        set(&|st| st.queued = titles.clone());
-        let item = match queue.pop_front() {
-            Some(i) => i,
-            None => match rx.recv() {
-                Ok(Msg::Play(i)) => i,
-                Ok(Msg::Pause(p)) => {
-                    paused = p;
-                    continue;
-                }
-                Ok(Msg::Stop) => continue,
-                Err(_) => return,
-            },
-        };
-        let Ok(sink) = Sink::try_new(&handle) else { continue };
-        sink.set_volume(item.voice.volume.clamp(0.0, 1.0));
-        match render(&item, speaker.as_ref()) {
-            Ok(parts) => parts.into_iter().for_each(|p| sink.append(p)),
-            Err(e) => {
-                set(&|st| st.error = Some(e.clone()));
-                continue;
+        let music_now = music.now.clone().filter(|_| music.level > 0.0);
+        set(&mut |st| {
+            st.now_playing = playing.clone();
+            st.queued = titles.clone();
+            st.music = music_now.clone();
+            if error.is_some() {
+                st.error = error.clone();
+            } else if playing.is_some() {
+                st.error = None;
             }
-        }
-        if paused {
-            sink.pause();
-        }
-        let title = item.title.clone();
-        set(&|st| {
-            st.now_playing = Some(title.clone());
-            st.error = None;
         });
-        while !sink.empty() {
-            match rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(Msg::Play(i)) => {
-                    queue.push_back(i);
-                    let titles: Vec<String> = queue.iter().map(|i| i.title.clone()).collect();
-                    set(&|st| st.queued = titles.clone());
-                }
-                Ok(Msg::Stop) => {
-                    queue.clear();
-                    sink.stop();
-                    break;
-                }
-                Ok(Msg::Pause(p)) => {
-                    paused = p;
-                    if p { sink.pause() } else { sink.play() }
-                }
-                Err(RecvTimeoutError::Timeout) => {}
-                Err(RecvTimeoutError::Disconnected) => return,
-            }
-        }
-        set(&|st| st.now_playing = None);
-        // A short gap between back-to-back announcements.
-        std::thread::sleep(Duration::from_millis(800));
     }
 }
 
@@ -372,31 +492,30 @@ mod tests {
         assert!((peak - 0.9).abs() < 1e-3);
     }
 
-    /// Needs Windows speech; writes target\speech-test.wav to listen to.
-    #[test]
-    #[ignore]
-    fn speaks_through_windows() {
-        let speaker = Speaker::new().unwrap();
-        assert!(!speaker.names().is_empty());
-        println!("voices: {:?}", speaker.names());
-        let voice = Voice::default();
-        let (speech, rate) = speaker.speak("Cabin crew, please take your seats for takeoff.", Role::Captain, &voice).unwrap();
-        assert!(speech.len() > rate as usize, "under a second of speech");
-        let mut all = pa_effect(&chime(rate), rate);
-        all.extend(silence(rate, 0.4));
-        all.extend(pa_effect(&speech, rate));
-        let spec = hound::WavSpec { channels: 1, sample_rate: rate, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
-        let mut w = hound::WavWriter::create(concat!(env!("CARGO_MANIFEST_DIR"), "/target/speech-test.wav"), spec).unwrap();
-        for s in all {
-            w.write_sample((s * i16::MAX as f32) as i16).unwrap();
-        }
-        w.finalize().unwrap();
-    }
-
     #[test]
     fn chime_is_two_seconds_and_quiet_at_the_end() {
         let c = chime(44_100);
         assert!(c.len() > 88_000);
         assert!(c[c.len() - 1].abs() < 0.05);
+    }
+
+    fn rms(v: &[f32]) -> f32 {
+        (v.iter().map(|s| s * s).sum::<f32>() / v.len() as f32).sqrt()
+    }
+
+    #[test]
+    fn muffle_cuts_highs_and_keeps_lows() {
+        let rate = 44_100;
+        let tone = |hz: f32| -> Vec<f32> { (0..rate).map(|i| (2.0 * std::f32::consts::PI * hz * i as f32 / rate as f32).sin()).collect() };
+        let through = |hz: f32, cutoff: f32| -> f32 {
+            let m = Arc::new(Muffle::default());
+            m.set(cutoff, 1.0);
+            let out: Vec<f32> = Muffled::new(SamplesBuffer::new(1, rate as u32, tone(hz)), m).collect();
+            rms(&out[rate as usize / 2..])
+        };
+        let open = through(4000.0, 0.0);
+        assert!((open - std::f32::consts::FRAC_1_SQRT_2).abs() < 0.02, "open filter passes everything: {open}");
+        assert!(through(4000.0, MUFFLED_HZ) < 0.1, "highs cut");
+        assert!(through(200.0, MUFFLED_HZ) > 0.6, "lows kept");
     }
 }

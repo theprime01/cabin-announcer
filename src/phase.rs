@@ -1,7 +1,7 @@
 //! Works out the phase of flight from sim telemetry and decides when each
 //! announcement ("cue") should play. Pure logic, driven by `Director::update`.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum DoorState {
@@ -12,6 +12,20 @@ pub enum DoorState {
     Closed,
     Armed,
 }
+
+/// GSX Pro service states (L:FSDT_GSX_*_STATE): 1 available, 2 not
+/// available, 3 bypassed, 4 requested, 5 performing, 6 completed. 0 means GSX
+/// isn't running.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Gsx {
+    pub boarding: u8,
+    pub deboarding: u8,
+    pub departure: u8,
+}
+
+pub const GSX_REQUESTED: u8 = 4;
+pub const GSX_PERFORMING: u8 = 5;
+pub const GSX_COMPLETED: u8 = 6;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Telemetry {
@@ -24,6 +38,8 @@ pub struct Telemetry {
     pub agl: f64,
     /// Feet per minute.
     pub vertical_speed: f64,
+    /// Degrees.
+    pub heading: f64,
     pub engines_running: bool,
     pub parking_brake: bool,
     pub gear_down: bool,
@@ -33,6 +49,11 @@ pub struct Telemetry {
     /// Fasten seat belts sign lit.
     pub belts: bool,
     pub doors: DoorState,
+    pub gsx: Gsx,
+    /// Dark outside at the aircraft (sim local time).
+    pub night: bool,
+    /// More than 10 minutes past the scheduled departure time.
+    pub late_departure: bool,
     /// Feet, from the FMC when the aircraft reports it.
     pub cruise_alt: Option<f64>,
     /// Nautical miles to top of descent, from the FMC (0 once passed).
@@ -76,21 +97,35 @@ impl Phase {
             Phase::Turnaround => "Turnaround",
         }
     }
+
+    /// Boarding music plays at the gate before departure and while deboarding.
+    pub fn boarding_music(self) -> bool {
+        matches!(self, Phase::AtGate | Phase::Boarding | Phase::DoorsClosed | Phase::Arrived | Phase::Turnaround)
+    }
 }
 
 /// Every automatic announcement, in the order they normally play.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cue {
     BoardingWelcome,
+    BoardingComplete,
     ArmDoors,
+    DepartureDelay,
     CaptainWelcome,
+    PreSafety,
     SafetyDemo,
+    CabinDimTakeoff,
+    CabinSecureTakeoff,
+    TakeoffDelay,
     CrewSeatsTakeoff,
     BeltsOffClimb,
     CaptainCruise,
     Turbulence,
+    Holding,
     CaptainDescent,
     PrepareCabinLanding,
+    CabinDimLanding,
+    CabinSecureLanding,
     CrewSeatsLanding,
     GoAround,
     AfterLanding,
@@ -99,17 +134,26 @@ pub enum Cue {
 }
 
 impl Cue {
-    pub const ALL: [Cue; 15] = [
+    pub const ALL: [Cue; 24] = [
         Cue::BoardingWelcome,
+        Cue::BoardingComplete,
         Cue::ArmDoors,
+        Cue::DepartureDelay,
         Cue::CaptainWelcome,
+        Cue::PreSafety,
         Cue::SafetyDemo,
+        Cue::CabinDimTakeoff,
+        Cue::CabinSecureTakeoff,
+        Cue::TakeoffDelay,
         Cue::CrewSeatsTakeoff,
         Cue::BeltsOffClimb,
         Cue::CaptainCruise,
         Cue::Turbulence,
+        Cue::Holding,
         Cue::CaptainDescent,
         Cue::PrepareCabinLanding,
+        Cue::CabinDimLanding,
+        Cue::CabinSecureLanding,
         Cue::CrewSeatsLanding,
         Cue::GoAround,
         Cue::AfterLanding,
@@ -141,6 +185,7 @@ struct Holds {
     doors_shut: Hold,
     moving: Hold,
     taxiing: Hold,
+    stopped: Hold,
     airborne: Hold,
     grounded: Hold,
     level: Hold,
@@ -148,16 +193,54 @@ struct Holds {
     climbing: Hold,
     slow: Hold,
     parked: Hold,
+    gsx_boarded: Hold,
+}
+
+/// Spots a hold: a full turn flown at a steady altitude within a few minutes.
+#[derive(Default)]
+struct TurnTracker {
+    last_heading: Option<f64>,
+    /// (time, heading change in degrees, altitude)
+    samples: VecDeque<(f64, f64, f64)>,
+}
+
+const HOLD_WINDOW_SECS: f64 = 480.0;
+
+impl TurnTracker {
+    fn update(&mut self, heading: f64, altitude: f64, now: f64) {
+        if let Some(last) = self.last_heading {
+            let delta = (heading - last + 540.0) % 360.0 - 180.0;
+            self.samples.push_back((now, delta, altitude));
+        }
+        self.last_heading = Some(heading);
+        while self.samples.front().is_some_and(|&(t, _, _)| now - t > HOLD_WINDOW_SECS) {
+            self.samples.pop_front();
+        }
+    }
+
+    fn reset(&mut self) {
+        self.samples.clear();
+    }
+
+    fn full_circle(&self) -> bool {
+        let turned: f64 = self.samples.iter().map(|&(_, d, _)| d).sum();
+        let (lo, hi) = self.samples.iter().fold((f64::MAX, f64::MIN), |(lo, hi), &(_, _, a)| (lo.min(a), hi.max(a)));
+        turned.abs() >= 330.0 && hi - lo < 1500.0
+    }
 }
 
 const TURNAROUND_SECS: f64 = 600.0;
 const TURBULENCE_COOLDOWN_SECS: f64 = 600.0;
+const HOLDING_COOLDOWN_SECS: f64 = 1800.0;
+const GATE_DELAY_SECS: f64 = 600.0;
+const TAXI_DELAY_SECS: f64 = 240.0;
 
 pub struct Director {
     phase: Phase,
     phase_since: f64,
     done: HashSet<Cue>,
     holds: Holds,
+    turns: TurnTracker,
     started: bool,
     last: Telemetry,
     /// The belt sign was lit at some point this flight, so the aircraft reports it.
@@ -165,6 +248,7 @@ pub struct Director {
     max_altitude: f64,
     min_approach_agl: f64,
     last_turbulence: Option<f64>,
+    last_holding: Option<f64>,
 }
 
 impl Default for Director {
@@ -180,12 +264,14 @@ impl Director {
             phase_since: 0.0,
             done: HashSet::new(),
             holds: Holds::default(),
+            turns: TurnTracker::default(),
             started: false,
             last: Telemetry::default(),
             belts_seen_on: false,
             max_altitude: 0.0,
             min_approach_agl: f64::MAX,
             last_turbulence: None,
+            last_holding: None,
         }
     }
 
@@ -204,6 +290,8 @@ impl Director {
         self.max_altitude = 0.0;
         self.min_approach_agl = f64::MAX;
         self.last_turbulence = None;
+        self.last_holding = None;
+        self.turns.reset();
         self.set_phase(Phase::AtGate, now);
     }
 
@@ -224,8 +312,21 @@ impl Director {
         }
     }
 
+    /// Plays a cue again even if it has played before.
+    fn recue(&mut self, cue: Cue, out: &mut Vec<Cue>) {
+        self.done.remove(&cue);
+        self.cue(cue, out);
+    }
+
     fn skip(&mut self, cues: &[Cue]) {
         self.done.extend(cues.iter().copied());
+    }
+
+    fn safety(&mut self, out: &mut Vec<Cue>) {
+        if !self.done.contains(&Cue::SafetyDemo) {
+            self.cue(Cue::PreSafety, out);
+            self.cue(Cue::SafetyDemo, out);
+        }
     }
 
     /// Picks a sensible starting phase when the app connects mid-flight, and
@@ -234,12 +335,24 @@ impl Director {
         use Cue::*;
         self.started = true;
         self.max_altitude = t.altitude;
-        let departure = [BoardingWelcome, ArmDoors, CaptainWelcome, SafetyDemo, CrewSeatsTakeoff];
+        let departure = [
+            BoardingWelcome,
+            BoardingComplete,
+            ArmDoors,
+            DepartureDelay,
+            CaptainWelcome,
+            PreSafety,
+            SafetyDemo,
+            CabinDimTakeoff,
+            CabinSecureTakeoff,
+            TakeoffDelay,
+            CrewSeatsTakeoff,
+        ];
         let phase = if !t.on_ground {
             self.skip(&departure);
             self.belts_seen_on = t.belts;
             if t.agl < 4000.0 && t.vertical_speed < -300.0 {
-                self.skip(&[BeltsOffClimb, CaptainCruise, CaptainDescent, PrepareCabinLanding]);
+                self.skip(&[BeltsOffClimb, CaptainCruise, CaptainDescent, PrepareCabinLanding, CabinDimLanding]);
                 Phase::Approach
             } else if t.vertical_speed < -500.0 {
                 self.skip(&[BeltsOffClimb, CaptainCruise, CaptainDescent]);
@@ -251,7 +364,8 @@ impl Director {
                 Phase::Cruise
             }
         } else if t.engines_running {
-            self.skip(&departure);
+            // Already taxiing: the gate announcements are over, the runway ones aren't.
+            self.skip(&departure[..7]);
             if t.ground_speed > 40.0 { Phase::TakeoffRoll } else { Phase::TaxiOut }
         } else {
             Phase::AtGate
@@ -272,6 +386,8 @@ impl Director {
         let prev = std::mem::replace(&mut self.last, t.clone());
         let doors_open = t.doors == DoorState::Open;
         let doors_shut = matches!(t.doors, DoorState::Closed | DoorState::Armed);
+        let gsx_boarding = matches!(t.gsx.boarding, GSX_REQUESTED | GSX_PERFORMING);
+        let gsx_pushback = t.gsx.departure == GSX_PERFORMING;
         let moving = t.pushback || t.ground_speed > 1.0;
         let belts_on_now = t.belts && !prev.belts;
         let belts_off_now = !t.belts && prev.belts;
@@ -280,6 +396,9 @@ impl Director {
         }
         if !t.on_ground {
             self.max_altitude = self.max_altitude.max(t.altitude);
+            self.turns.update(t.heading, t.altitude, now);
+        } else {
+            self.turns.reset();
         }
 
         let h = &mut self.holds;
@@ -287,6 +406,7 @@ impl Director {
         h.doors_shut.update(doors_shut, now);
         h.moving.update(moving, now);
         h.taxiing.update(t.engines_running && !t.pushback && t.ground_speed > 3.0, now);
+        h.stopped.update(t.on_ground && t.engines_running && t.ground_speed < 1.0, now);
         h.airborne.update(!t.on_ground && t.agl > 50.0, now);
         h.grounded.update(t.on_ground, now);
         h.level.update(!t.on_ground && t.vertical_speed.abs() < 300.0, now);
@@ -294,10 +414,13 @@ impl Director {
         h.climbing.update(!t.on_ground && t.vertical_speed > 1000.0, now);
         h.slow.update(t.on_ground && t.ground_speed < 30.0, now);
         h.parked.update(t.on_ground && t.ground_speed < 1.0 && t.parking_brake && !t.engines_running, now);
+        h.gsx_boarded.update(t.gsx.boarding == GSX_COMPLETED, now);
         let h = &self.holds;
         let (doors_open_5, doors_shut_5) = (h.doors_open.held(now, 5.0), h.doors_shut.held(now, 5.0));
         let (moving_2, taxiing_3, airborne_2) = (h.moving.held(now, 2.0), h.taxiing.held(now, 3.0), h.airborne.held(now, 2.0));
         let grounded_2 = h.grounded.held(now, 2.0);
+        let stopped_long = h.stopped.held(now, TAXI_DELAY_SECS);
+        let gsx_boarded = h.gsx_boarded.held(now, 5.0);
         let level_cruise = match t.cruise_alt {
             Some(c) if t.altitude > c - 500.0 => h.level.held(now, 30.0),
             _ => t.altitude > 8000.0 && h.level.held(now, 90.0),
@@ -305,26 +428,48 @@ impl Director {
         let descending_30 = h.descending.held(now, 30.0);
         let (climbing_8, slow_5, parked_5) = (h.climbing.held(now, 8.0), h.slow.held(now, 5.0), h.parked.held(now, 5.0));
 
+        // A hold can happen any time in the air, away from the runway.
+        let since_holding = self.last_holding.map_or(f64::MAX, |l| now - l);
+        let can_hold = matches!(self.phase, Phase::Cruise | Phase::Descent | Phase::Approach) && t.agl > 2000.0;
+        if can_hold && self.turns.full_circle() && since_holding > HOLDING_COOLDOWN_SECS {
+            self.recue(Holding, &mut out);
+            self.last_holding = Some(now);
+            self.turns.reset();
+        }
+
         match self.phase {
-            Phase::AtGate | Phase::Boarding => {
-                if self.phase == Phase::AtGate && doors_open_5 {
+            Phase::AtGate => {
+                if t.gsx.boarding == GSX_PERFORMING || (!gsx_boarding && doors_open_5) {
                     self.set_phase(Phase::Boarding, now);
                     self.cue(BoardingWelcome, &mut out);
-                } else if self.phase == Phase::Boarding && doors_shut_5 {
-                    self.set_phase(Phase::DoorsClosed, now);
-                    self.cue(ArmDoors, &mut out);
                 } else if t.engines_running || moving_2 {
-                    // Aircraft without door data: departing is the first sign.
+                    // No boarding seen: departing is the first sign.
                     self.set_phase(Phase::DoorsClosed, now);
                     self.cue(ArmDoors, &mut out);
                 }
             }
+            Phase::Boarding => {
+                if t.late_departure {
+                    self.cue(DepartureDelay, &mut out);
+                }
+                // GSX says when boarding is really done; doors may close later.
+                let finished = gsx_boarded || (!gsx_boarding && doors_shut_5);
+                if finished || t.engines_running || moving_2 {
+                    self.cue(BoardingComplete, &mut out);
+                    self.cue(ArmDoors, &mut out);
+                    self.set_phase(Phase::DoorsClosed, now);
+                }
+            }
             Phase::DoorsClosed => {
-                if doors_open_5 {
+                let stuck = self.in_phase_for(now) >= GATE_DELAY_SECS;
+                if (t.late_departure || stuck) && !moving_2 {
+                    self.cue(DepartureDelay, &mut out);
+                }
+                if t.gsx.boarding != GSX_COMPLETED && doors_open_5 && !t.engines_running {
                     self.set_phase(Phase::Boarding, now);
-                } else if moving_2 {
+                } else if moving_2 || gsx_pushback {
                     self.cue(CaptainWelcome, &mut out);
-                    self.cue(SafetyDemo, &mut out);
+                    self.safety(&mut out);
                     let next = if taxiing_3 { Phase::TaxiOut } else { Phase::Pushback };
                     self.set_phase(next, now);
                 } else if self.in_phase_for(now) >= 20.0 {
@@ -337,14 +482,29 @@ impl Director {
                 }
             }
             Phase::TaxiOut => {
-                self.cue(SafetyDemo, &mut out);
+                self.safety(&mut out);
+                let taxi_time = self.in_phase_for(now);
+                if t.night && taxi_time >= 30.0 {
+                    self.cue(CabinDimTakeoff, &mut out);
+                }
+                if taxi_time >= 45.0 {
+                    self.cue(CabinSecureTakeoff, &mut out);
+                }
+                if stopped_long && !self.done.contains(&CrewSeatsTakeoff) {
+                    self.cue(TakeoffDelay, &mut out);
+                }
                 // Strobes or landing lights coming on means entering the runway.
                 let lights_on = (t.strobe && !prev.strobe) || (t.landing_light && !prev.landing_light);
-                if lights_on && self.in_phase_for(now) > 10.0 {
+                if lights_on && taxi_time > 10.0 {
+                    if t.night {
+                        self.cue(CabinDimTakeoff, &mut out);
+                    }
+                    self.cue(CabinSecureTakeoff, &mut out);
                     self.cue(CrewSeatsTakeoff, &mut out);
                 }
                 if t.on_ground && t.ground_speed > 40.0 {
                     self.cue(CrewSeatsTakeoff, &mut out);
+                    self.skip(&[CabinDimTakeoff, CabinSecureTakeoff, TakeoffDelay]);
                     self.set_phase(Phase::TakeoffRoll, now);
                 }
             }
@@ -384,9 +544,7 @@ impl Director {
                 }
                 let since_turbulence = self.last_turbulence.map_or(f64::MAX, |l| now - l);
                 if belts_on_now && self.done.contains(&BeltsOffClimb) && since_turbulence > TURBULENCE_COOLDOWN_SECS {
-                    // Re-armed so it can play again on the next encounter.
-                    self.done.remove(&Turbulence);
-                    self.cue(Turbulence, &mut out);
+                    self.recue(Turbulence, &mut out);
                     self.last_turbulence = Some(now);
                 }
                 if t.distance_to_tod.is_some_and(|d| d > 0.0 && d <= 10.0) {
@@ -403,6 +561,9 @@ impl Director {
                 let low = t.agl < 6000.0 || (t.altitude < 11000.0 && t.agl < 10000.0);
                 if low || (belts_on_now && self.max_altitude > 15000.0) {
                     self.cue(PrepareCabinLanding, &mut out);
+                    if t.night {
+                        self.cue(CabinDimLanding, &mut out);
+                    }
                 }
                 if t.agl < 4000.0 || t.gear_down {
                     self.cue(PrepareCabinLanding, &mut out);
@@ -412,19 +573,23 @@ impl Director {
             }
             Phase::Approach => {
                 self.min_approach_agl = self.min_approach_agl.min(t.agl);
+                if t.agl < 5000.0 {
+                    self.cue(CabinSecureLanding, &mut out);
+                }
                 if t.gear_down || t.agl < 2500.0 {
+                    self.cue(CabinSecureLanding, &mut out);
                     self.cue(CrewSeatsLanding, &mut out);
                 }
                 if grounded_2 {
                     self.set_phase(Phase::Rollout, now);
                 } else if climbing_8 && self.min_approach_agl < 1500.0 && t.agl > self.min_approach_agl + 400.0 {
-                    self.done.remove(&GoAround);
-                    self.cue(GoAround, &mut out);
+                    self.recue(GoAround, &mut out);
                     // The crew sit down again for the next approach.
                     self.done.remove(&CrewSeatsLanding);
+                    self.done.remove(&CabinSecureLanding);
                     self.min_approach_agl = t.agl;
                     self.set_phase(Phase::Climb, now);
-                    self.skip(&[BeltsOffClimb, CaptainCruise, CaptainDescent, PrepareCabinLanding]);
+                    self.skip(&[BeltsOffClimb, CaptainCruise, CaptainDescent, PrepareCabinLanding, CabinDimLanding]);
                 }
             }
             Phase::Rollout => {
@@ -443,8 +608,9 @@ impl Director {
                 }
             }
             Phase::Arrived => {
+                let gsx_deboarding = t.gsx.deboarding == GSX_PERFORMING;
                 let belts_off = if self.belts_seen_on { !t.belts } else { self.in_phase_for(now) >= 20.0 };
-                if belts_off && self.in_phase_for(now) >= 5.0 {
+                if gsx_deboarding || (belts_off && self.in_phase_for(now) >= 5.0) {
                     self.cue(Disembark, &mut out);
                     self.set_phase(Phase::Turnaround, now);
                 }
@@ -487,19 +653,20 @@ mod tests {
             f(&mut self.t);
             self.run(secs);
         }
-    }
-
-    fn at_gate() -> Telemetry {
-        Telemetry {
-            on_ground: true,
-            parking_brake: true,
-            belts: false,
-            doors: DoorState::Closed,
-            ..Default::default()
+        /// Flies a steady turn at `deg_per_sec` for `secs` seconds.
+        fn turn(&mut self, deg_per_sec: f64, secs: u32) {
+            for _ in 0..secs {
+                self.t.heading = (self.t.heading + deg_per_sec).rem_euclid(360.0);
+                self.run(1);
+            }
         }
     }
 
-    fn fly(s: &mut Sim) {
+    fn at_gate() -> Telemetry {
+        Telemetry { on_ground: true, parking_brake: true, doors: DoorState::Closed, ..Default::default() }
+    }
+
+    fn depart(s: &mut Sim) {
         // Boarding, doors closed, belts on.
         s.set(|t| t.doors = DoorState::Open, 10);
         s.set(|t| t.belts = true, 60);
@@ -514,7 +681,9 @@ mod tests {
         s.set(|t| t.ground_speed = 140.0, 30);
         s.set(|t| { t.on_ground = false; t.agl = 500.0; t.altitude = 600.0; t.vertical_speed = 2500.0; t.gear_down = false; }, 10);
         s.set(|t| { t.agl = 12000.0; t.altitude = 12000.0; t.belts = false; }, 60);
-        // Cruise.
+    }
+
+    fn cruise_and_land(s: &mut Sim) {
         s.set(|t| { t.agl = 35000.0; t.altitude = 35000.0; t.vertical_speed = 0.0; }, 200);
         // Turbulence.
         s.set(|t| t.belts = true, 10);
@@ -533,21 +702,26 @@ mod tests {
     #[test]
     fn full_flight_plays_every_cue_in_order() {
         let mut s = Sim::new(at_gate());
-        fly(&mut s);
+        depart(&mut s);
+        cruise_and_land(&mut s);
         use Cue::*;
         assert_eq!(
             s.cues,
             vec![
                 BoardingWelcome,
+                BoardingComplete,
                 ArmDoors,
                 CaptainWelcome,
+                PreSafety,
                 SafetyDemo,
+                CabinSecureTakeoff,
                 CrewSeatsTakeoff,
                 BeltsOffClimb,
                 CaptainCruise,
                 Turbulence,
                 CaptainDescent,
                 PrepareCabinLanding,
+                CabinSecureLanding,
                 CrewSeatsLanding,
                 AfterLanding,
                 DisarmDoors,
@@ -558,9 +732,90 @@ mod tests {
     }
 
     #[test]
+    fn night_flights_dim_the_cabin() {
+        let mut s = Sim::new(Telemetry { night: true, ..at_gate() });
+        depart(&mut s);
+        cruise_and_land(&mut s);
+        let pos = |c| s.cues.iter().position(|&x| x == c).unwrap();
+        assert!(pos(Cue::CabinDimTakeoff) < pos(Cue::CrewSeatsTakeoff));
+        assert!(pos(Cue::PrepareCabinLanding) < pos(Cue::CabinDimLanding));
+        assert!(pos(Cue::CabinDimLanding) < pos(Cue::CrewSeatsLanding));
+    }
+
+    #[test]
+    fn gsx_drives_boarding_and_deboarding() {
+        let mut s = Sim::new(Telemetry { doors: DoorState::Open, gsx: Gsx { boarding: 1, ..Default::default() }, ..at_gate() });
+        // Doors open, but GSX hasn't started boarding: no welcome yet.
+        s.set(|t| t.gsx.boarding = GSX_REQUESTED, 30);
+        assert!(s.cues.is_empty());
+        s.set(|t| t.gsx.boarding = GSX_PERFORMING, 60);
+        assert_eq!(s.cues, vec![Cue::BoardingWelcome]);
+        // GSX finishes boarding while the doors are still open.
+        s.set(|t| t.gsx.boarding = GSX_COMPLETED, 10);
+        assert_eq!(&s.cues[1..], &[Cue::BoardingComplete, Cue::ArmDoors]);
+        // GSX pushback starts before the aircraft moves.
+        s.set(|t| { t.doors = DoorState::Closed; t.gsx.departure = GSX_PERFORMING; }, 2);
+        assert!(s.cues.contains(&Cue::SafetyDemo));
+    }
+
+    #[test]
+    fn gsx_deboarding_triggers_disembark() {
+        let mut s = Sim::new(Telemetry { altitude: 3000.0, agl: 2000.0, vertical_speed: -700.0, gear_down: true, belts: true, engines_running: true, ..Default::default() });
+        s.set(|t| { t.on_ground = true; t.agl = 0.0; t.vertical_speed = 0.0; t.ground_speed = 100.0; }, 5);
+        s.set(|t| t.ground_speed = 10.0, 30);
+        s.set(|t| { t.ground_speed = 0.0; t.parking_brake = true; t.engines_running = false; }, 10);
+        assert!(!s.cues.contains(&Cue::Disembark), "belts still on");
+        s.set(|t| t.gsx.deboarding = GSX_PERFORMING, 2);
+        assert_eq!(s.cues.last(), Some(&Cue::Disembark));
+    }
+
+    #[test]
+    fn late_and_stuck_departures() {
+        let mut s = Sim::new(at_gate());
+        s.set(|t| t.doors = DoorState::Open, 10);
+        s.set(|t| t.late_departure = true, 5);
+        assert_eq!(s.cues, vec![Cue::BoardingWelcome, Cue::DepartureDelay]);
+
+        let mut s = Sim::new(at_gate());
+        s.set(|t| t.doors = DoorState::Open, 10);
+        s.set(|t| t.doors = DoorState::Closed, 10);
+        s.run(GATE_DELAY_SECS as u32);
+        assert_eq!(s.cues.last(), Some(&Cue::DepartureDelay));
+    }
+
+    #[test]
+    fn long_wait_at_the_holding_point() {
+        let mut s = Sim::new(Telemetry { on_ground: true, engines_running: true, ..Default::default() });
+        s.set(|t| t.ground_speed = 15.0, 60);
+        s.set(|t| t.ground_speed = 0.0, TAXI_DELAY_SECS as u32 + 2);
+        assert!(s.cues.contains(&Cue::TakeoffDelay));
+    }
+
+    #[test]
+    fn holding_pattern_is_announced_once() {
+        let mut s = Sim::new(Telemetry { altitude: 15000.0, agl: 14000.0, ..Default::default() });
+        s.run(70);
+        // A standard-rate turn is 3 degrees a second: a full circle in two minutes.
+        s.turn(3.0, 130);
+        assert_eq!(s.cues.iter().filter(|&&c| c == Cue::Holding).count(), 1);
+        s.turn(3.0, 240);
+        assert_eq!(s.cues.iter().filter(|&&c| c == Cue::Holding).count(), 1, "cooldown");
+    }
+
+    #[test]
+    fn a_procedure_turn_is_not_a_hold() {
+        let mut s = Sim::new(Telemetry { altitude: 15000.0, agl: 14000.0, ..Default::default() });
+        s.run(70);
+        s.turn(3.0, 60);
+        s.turn(-3.0, 60);
+        assert!(!s.cues.contains(&Cue::Holding));
+    }
+
+    #[test]
     fn turnaround_starts_the_next_flight() {
         let mut s = Sim::new(at_gate());
-        fly(&mut s);
+        depart(&mut s);
+        cruise_and_land(&mut s);
         s.run(TURNAROUND_SECS as u32 + 1);
         assert_eq!(s.d.phase(), Phase::AtGate);
         let before = s.cues.len();
@@ -597,6 +852,6 @@ mod tests {
         s.set(|t| t.ground_speed = 140.0, 10);
         s.set(|t| { t.on_ground = false; t.agl = 11000.0; t.altitude = 11000.0; t.vertical_speed = 2000.0; }, 150);
         use Cue::*;
-        assert_eq!(s.cues, vec![ArmDoors, CaptainWelcome, SafetyDemo, CrewSeatsTakeoff, BeltsOffClimb]);
+        assert_eq!(s.cues, vec![ArmDoors, CaptainWelcome, PreSafety, SafetyDemo, CabinSecureTakeoff, CrewSeatsTakeoff, BeltsOffClimb]);
     }
 }

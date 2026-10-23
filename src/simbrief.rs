@@ -41,32 +41,23 @@ fn place(airport: &str) -> String {
     title_case(&keep.join(" "))
 }
 
-pub fn parse(ofp: &Value, keep_airline: &str, keep_captain: &str) -> Result<Flight, String> {
+pub fn parse(ofp: &Value) -> Result<Flight, String> {
     if text(ofp, &["fetch", "status"]).to_ascii_lowercase().contains("error") {
         return Err(text(ofp, &["fetch", "status"]));
     }
     let icao = text(ofp, &["general", "icao_airline"]);
     let number = text(ofp, &["general", "flight_number"]);
-    let airline = if keep_airline.is_empty() {
-        crate::airline::by_code(&icao).map_or(icao.clone(), |a| a.name.to_string())
-    } else {
-        keep_airline.to_string()
-    };
-    let minutes = text(ofp, &["times", "est_block"]).parse::<f64>().ok().map(|s| (s / 60.0).round() as u32);
-    let cruise = text(ofp, &["general", "initial_altitude"]).parse::<u32>().ok();
     Ok(Flight {
-        airline,
         airline_icao: icao.clone(),
         flight_number: format!("{icao}{number}"),
         origin: place(&text(ofp, &["origin", "name"])),
         destination: place(&text(ofp, &["destination", "name"])),
-        captain: keep_captain.to_string(),
-        flight_time_minutes: minutes,
-        cruise_altitude_ft: cruise,
+        // Scheduled off-block time, Unix seconds.
+        scheduled_departure: text(ofp, &["times", "sched_out"]).parse::<i64>().ok().filter(|&t| t > 0),
     })
 }
 
-pub fn fetch(user: &str, keep_airline: &str, keep_captain: &str) -> Result<Flight, String> {
+pub fn fetch(user: &str) -> Result<Flight, String> {
     let user = user.trim();
     if user.is_empty() {
         return Err("enter your SimBrief username first".into());
@@ -80,7 +71,7 @@ pub fn fetch(user: &str, keep_airline: &str, keep_captain: &str) -> Result<Fligh
         .map_err(|e| format!("SimBrief: {e}"))?
         .into_json()
         .map_err(|e| format!("SimBrief: {e}"))?;
-    parse(&ofp, keep_airline, keep_captain)
+    parse(&ofp)
 }
 
 #[cfg(test)]
@@ -94,15 +85,13 @@ mod tests {
             "general": {"icao_airline": "BAW", "flight_number": "117", "initial_altitude": "36000"},
             "origin": {"name": "LONDON HEATHROW"},
             "destination": {"name": "JOHN F KENNEDY INTL"},
-            "times": {"est_block": "28200"}
+            "times": {"est_block": "28200", "sched_out": "1793001600"}
         });
-        let f = parse(&ofp, "", "Smith").unwrap();
-        assert_eq!(f.airline, "British Airways");
+        let f = parse(&ofp).unwrap();
+        assert_eq!(f.airline_icao, "BAW");
         assert_eq!(f.flight_number, "BAW117");
         assert_eq!(f.origin, "London Heathrow");
         assert_eq!(f.destination, "John F Kennedy");
-        assert_eq!(f.flight_time_minutes, Some(470));
-        assert_eq!(f.cruise_altitude_ft, Some(36000));
-        assert_eq!(f.captain, "Smith");
+        assert_eq!(f.scheduled_departure, Some(1_793_001_600));
     }
 }

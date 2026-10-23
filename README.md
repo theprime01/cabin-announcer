@@ -1,63 +1,83 @@
 # Cabin Announcer
 
-Automatic cabin announcements for Microsoft Flight Simulator 2024. The app watches your flight through SimConnect, works out which phase you're in, and plays the right captain or cabin-crew announcement at the right moment, from boarding through to disembarking.
+Real cabin announcements for Microsoft Flight Simulator 2024, played automatically at the right moment of every flight, from boarding to disembarking.
 
-It works with any airliner. With the **PMDG 737** and **PMDG 777** it also reads the real seat belt sign selector, the passenger doors (on the 777, whether they're armed) and the FMC (cruise altitude, distance to top of descent, distance to destination and flight number).
+The app watches your flight through SimConnect and works out which phase you're in. It then plays the matching recording from a **sound pack**. It works with any airliner, and it understands:
+
+- **PMDG 737 and 777**: the real seat belt sign selector, the passenger doors (on the 777, whether they're armed) and the FMC (cruise altitude and top of descent).
+- **GSX Pro**: boarding, pushback and deboarding follow GSX's own progress.
+- **Your airline**: detected from your SimBrief plan or your livery, so a Norwegian flight plays the Norwegian pack.
+
+There's no computer voice. Announcements without a recording simply stay silent.
 
 ## What plays when
 
 | Announcement | Who | When |
 |---|---|---|
-| Boarding welcome | Cabin crew | At the gate, a passenger door has been open for 5 s |
-| Arm doors | Cabin crew | Doors closed, or engines start or pushback begins |
-| Captain's welcome | Captain | 20 s after the doors close, or at pushback |
-| Safety demonstration | Cabin crew | Pushback or start of taxi |
-| Cabin crew, seats for takeoff | Captain | Strobes or landing lights switched on while taxiing (or at 40 kt) |
-| Seat belt sign off | Cabin crew | Belt sign switched off in the climb (aircraft without a belt sign: 2 min above 10,000 ft) |
-| Captain's cruise update | Captain | 60 s after levelling off at cruise |
-| Turbulence | Cabin crew | Belt sign switched back on in cruise (at most every 10 min) |
-| Captain's descent announcement | Captain | 10 nm before the FMC's top of descent, or once descending |
-| Prepare the cabin for landing | Cabin crew | Descending below about 10,000 ft, or belt sign on in the descent |
-| Cabin crew, seats for landing | Captain | Gear down or below 2,500 ft AGL |
-| Go-around | Captain | Climbing away after getting below 1,500 ft AGL on approach |
-| Welcome after landing | Cabin crew | Slowed below 30 kt after touchdown (includes local time and temperature) |
+| Boarding welcome | Cabin crew | GSX starts boarding, or a door has been open at the gate for 5 s |
+| Boarding complete | Cabin crew | GSX finishes boarding, or the doors close |
+| Arm doors | Cabin crew | Doors closed, before pushback |
+| Departure delay | Flight deck | 10 min past the SimBrief departure time, or 10 min at the gate with the doors closed |
+| Captain's welcome | Flight deck | 20 s after the doors close, or at pushback |
+| Before the safety briefing, safety briefing | Cabin crew | Pushback (GSX or tug) or start of taxi |
+| Cabin lights dimmed for takeoff | Cabin crew | Taxiing at night |
+| Cabin crew, secure the cabin for takeoff | Flight deck | 45 s into the taxi, or entering the runway |
+| Takeoff delay | Flight deck | Stopped for 4 min while taxiing out |
+| Cabin crew, seats for takeoff | Flight deck | Strobes or landing lights switched on while taxiing (or at 40 kt) |
+| After takeoff, seat belt sign off | Cabin crew | Belt sign switched off in the climb |
+| Captain's cruise update | Flight deck | 60 s after levelling off at cruise |
+| Seat belts on (turbulence) | Cabin crew | Belt sign switched back on in cruise (at most every 10 min) |
+| Holding | Flight deck | A full circle flown at a steady altitude (at most every 30 min) |
+| Captain's descent announcement | Flight deck | 10 nm before the FMC top of descent, or once descending |
+| Descent, seat belts on | Cabin crew | Descending below about 10,000 ft, or belt sign on in the descent |
+| Cabin lights dimmed for landing | Cabin crew | Descending at night |
+| Cabin crew, secure the cabin for landing | Flight deck | Below 5,000 ft on the approach |
+| Cabin crew, seats for landing | Flight deck | Gear down or below 2,500 ft |
+| Go-around | Flight deck | Climbing away after getting below 1,500 ft on approach |
+| Welcome after landing | Cabin crew | Slowed below 30 kt after touchdown |
 | Disarm doors | Cabin crew | Parked, parking brake set, engines off |
-| Disembarking | Cabin crew | Belt sign off at the gate |
+| Disembarking | Cabin crew | Belt sign off at the gate, or GSX deboarding starts |
 
-If you connect mid-flight, the app works out the current phase and skips the announcements you've already missed. Ten minutes after disembarking it starts over for the next flight; the **New flight** button does the same straight away.
+Boarding music plays at the gate (and while deboarding) and fades out for pushback. Optional cabin ambience plays from doors closed to the gate. Both dip under announcements.
+
+If you connect mid-flight, the app works out the current phase and skips the announcements you've already missed. Ten minutes after disembarking it starts over for the next flight; **New flight** does the same straight away.
+
+## Sound packs
+
+A pack is a folder of recordings, one subfolder per announcement. Packs live in `%APPDATA%\CabinAnnouncer\packs`.
+
+- **Fenix A320 owners:** the **Sound packs** tab finds Fenix-format announcement sets in your Community folder (`<package>\Announcements\<airline>\`) and imports each one with a click. Each airline folder (BAW, EZY, …) becomes a pack for that airline, and `Default` plays for the rest. Universal Announcer packs use the same format.
+- **Any other pack:** install it from a zip, a folder or an `https://` link, or drag it onto the window. Files are sorted into announcements by name: Fenix names like `CrewSeatsTakeoff.ogg`, or words like "safety", "boarding" and "turbulence". Files that can't be matched go into `_unsorted` for you to move.
+
+Each pack can be tagged with airline codes, and sister airlines count, so `NAX` covers all of Norwegian. Three per-pack options are available:
+- **Play every file in order**, for an announcement recorded in two languages.
+- **Add a PA chime**, for recordings that don't start with one.
+- **Fill gaps** (on by default): when an airline's pack lacks an announcement, the recording comes from a pack without an airline, such as Fenix Default.
+
+The app can also pick recordings by time of day and choose between alternative versions:
+- Fenix-style tags pick by time of day, so `BoardingWelcome[Morning].ogg` plays only in the morning (sim local time). A `morning`, `afternoon`, `evening` or `night` folder does the same.
+- Numbered versions such as `ArmDoors[2].ogg` are picked at random.
+
+On the **Announcements** tab you can preview any pack, including every recorded version of each announcement.
+
+Only install recordings you have the right to use. Real airline announcements are copyrighted, so none are included here.
+
+## Sound
+
+- **Cockpit camera:** quieter and muffled, as if heard through the flight deck door. Outside cameras have their own volume.
+- **Cabin PA effect:** makes clean studio recordings sound like the cabin speakers.
+- **Hotkeys** (they work while the sim has focus, and in VR): `Ctrl+Shift+F9` replays the last announcement, `F10` stops, `F11` pauses or resumes all sound.
 
 ## Setup
 
-1. Put `SimConnect.dll` next to `cabin-announcer.exe`. It comes with the MSFS 2024 SDK (`SimConnect SDK\lib\SimConnect.dll`).
-2. **PMDG only:** the aircraft must broadcast its SDK data. Add this to `737_Options.ini` / `777_Options.ini` in `%APPDATA%\Microsoft Flight Simulator 2024\WASM\MSFS2024\pmdg-aircraft-*\work\`:
+1. Download the latest release and put `SimConnect.dll` next to `cabin-announcer.exe`. It comes with the MSFS 2024 SDK (`SimConnect SDK\lib\SimConnect.dll`).
+2. **PMDG only:** the aircraft must broadcast its SDK data. The app offers to switch this on when it sees a PMDG aircraft without data. You can also add it yourself to `737_Options.ini` or `777_Options.ini` in `%APPDATA%\Microsoft Flight Simulator 2024\WASM\MSFS2024\pmdg-aircraft-*\work\`:
    ```ini
    [SDK]
    EnableDataBroadcast=1
    ```
-   The app offers to do this for you when it sees a PMDG aircraft without data. Reload the aircraft afterwards.
-3. Optional: enter your SimBrief username and press **Load latest flight plan**. This fills in the airline, flight number, cities, flight time and cruise altitude.
-
-## Airline detection
-
-The app works out the airline from your SimBrief plan first. Without one, it uses what the livery reports to the sim: its name, its ATC airline/callsign and the aircraft title. Sister companies count as the same airline, so Norwegian matches NAX, NSZ, NAN, IBK, NOZ and DAN, as well as "Norwegian", "NORSHUTTLE" and "REDNOSE". The detected airline's name is used in announcements unless you type one, and it picks the matching sound pack.
-
-## Sound packs
-
-A sound pack is a folder of recorded announcements. Install one on the **Sound packs** tab from a zip, a folder or an `https://` link, or drag it onto the window. Each file is sorted into an announcement by its name ("safety", "boarding", "turbulence"…), and anything that can't be matched goes into the pack's `_unsorted` folder for you to move.
-
-Give a pack one or more airline codes and it plays automatically when you fly for that airline. A pack with no codes plays for every airline that doesn't have its own. **Play every file in order** suits packs with the same announcement in two languages. Announcements a pack doesn't cover fall back to the computer voice.
-
-On the **Announcements** tab, **Recordings from** lets you preview any installed pack. Each announcement has **▶ Recording** and **▶ Voice** buttons, and when a pack has several versions of an announcement, each one is listed with its own play button.
-
-Packs live in `%APPDATA%\CabinAnnouncer\packs\<pack>\<announcement>\`, and settings are in `pack.toml`. Only install recordings you have the right to use. Real airline announcements are copyrighted.
-
-## Voices and your own recordings
-
-Speech uses the voices installed in Windows (Settings > Time & language > Speech). You can pick one voice for the captain and one for the cabin crew. A PA filter and a synthesised chime make the voices sound like the cabin speakers.
-
-To use real recordings, press **Open my recordings folder** on the Announcements tab and drop `.wav`, `.mp3`, `.ogg` or `.flac` files into the folder named after an announcement (for example `sounds\safety_demo`). If a folder has several files, the app picks one at random each time.
-
-You can edit every script. Placeholders like `{destination}` are filled in from the flight, and a `[bracketed part]` is left out when its details are unknown.
+3. Optional: tick **Start Cabin Announcer with MSFS 2024** on the Flight tab. This adds the app to the sim's `exe.xml` (a backup of the original is kept), and the app then closes when the sim does.
+4. Optional: enter your SimBrief username to set the airline and the scheduled departure time.
 
 Settings live in `%APPDATA%\CabinAnnouncer\config.toml`.
 
@@ -71,3 +91,7 @@ cargo test
 `package.ps1` builds a release, then copies the exe and `SimConnect.dll` into the destination folder. It looks for the DLL at the repo root (git ignores it), then in the MSFS 2024 SDK, or you can pass `-SimConnect <path>`.
 
 `tools\pmdg-offsets.ps1` uses the Visual Studio C++ compiler to print the PMDG SDK struct offsets used in `src\pmdg.rs`. Re-run it after a PMDG update changes the SDK headers.
+
+## License
+
+MIT, see [LICENSE](LICENSE). This covers the code only. Sound packs, the PMDG SDK and SimConnect belong to their owners.
