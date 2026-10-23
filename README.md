@@ -70,7 +70,7 @@ Only install recordings you have the right to use. Real airline announcements ar
 
 ## Setup
 
-1. Download the latest release and put `SimConnect.dll` next to `cabin-announcer.exe`. It comes with the MSFS 2024 SDK (`SimConnect SDK\lib\SimConnect.dll`).
+1. Download the latest release and unzip it anywhere. `SimConnect.dll`, Microsoft's library for talking to the sim, is included next to `cabin-announcer.exe`. If it's missing, the MSFS 2024 SDK has it in `SimConnect SDK\lib\`.
 2. **PMDG only:** the aircraft must broadcast its SDK data. The app offers to switch this on when it sees a PMDG aircraft without data. You can also add it yourself to `737_Options.ini` or `777_Options.ini` in `%APPDATA%\Microsoft Flight Simulator 2024\WASM\MSFS2024\pmdg-aircraft-*\work\`:
    ```ini
    [SDK]
@@ -88,10 +88,10 @@ cargo test
 .\tools\package.ps1 -Dest "C:\Games\Cabin Announcer"
 ```
 
-`package.ps1` builds a release, then copies the exe and `SimConnect.dll` into the destination folder. It looks for the DLL at the repo root (git ignores it), then in the MSFS 2024 SDK, or you can pass `-SimConnect <path>`.
+`package.ps1` builds a release, then copies the exe and `SimConnect.dll` into the destination folder. It looks for the DLL at the repo root (git ignores it), then in the MSFS 2024 SDK, or you can pass `-SimConnect <path>`. `tools\release.ps1` does the same, then zips the result with the README and LICENSE for a GitHub release.
 
 `tools\pmdg-offsets.ps1` uses the Visual Studio C++ compiler to print the PMDG SDK struct offsets used in `src\pmdg.rs`. Re-run it after a PMDG update changes the SDK headers.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). This covers the code only. Sound packs, the PMDG SDK and SimConnect belong to their owners.
+MIT, see [LICENSE](LICENSE). This covers the code only. Sound packs, the PMDG SDK and SimConnect belong to their owners. `SimConnect.dll` in the release is Microsoft's, shipped unmodified, as many MSFS add-ons do.
