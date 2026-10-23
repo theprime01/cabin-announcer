@@ -38,7 +38,7 @@ There's no computer voice. Announcements without a recording simply stay silent.
 | Disarm doors | Cabin crew | Parked, parking brake set, engines off |
 | Disembarking | Cabin crew | Belt sign off at the gate, or GSX deboarding starts |
 
-Boarding music plays at the gate (and while deboarding) and fades out for pushback. Optional cabin ambience plays from doors closed to the gate. Both dip under announcements.
+Boarding music plays only while GSX is boarding passengers. It fades out before each announcement and comes back once the last one has finished. Optional cabin ambience plays from doors closed to the gate and dips under announcements.
 
 If you connect mid-flight, the app works out the current phase and skips the announcements you've already missed. Ten minutes after disembarking it starts over for the next flight; **New flight** does the same straight away.
 

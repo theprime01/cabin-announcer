@@ -720,7 +720,7 @@ impl App {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut v.music, "");
                 ui.add_enabled(v.music, egui::Slider::new(&mut v.music_volume, 0.0..=1.0));
-                ui.label(gray("at the gate, before pushback and while deboarding"));
+                ui.label(gray("while GSX is boarding passengers; stops for announcements"));
             });
             ui.end_row();
             ui.label("Cabin ambience");

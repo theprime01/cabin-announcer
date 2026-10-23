@@ -97,11 +97,6 @@ impl Phase {
             Phase::Turnaround => "Turnaround",
         }
     }
-
-    /// Boarding music plays at the gate before departure and while deboarding.
-    pub fn boarding_music(self) -> bool {
-        matches!(self, Phase::AtGate | Phase::Boarding | Phase::DoorsClosed | Phase::Arrived | Phase::Turnaround)
-    }
 }
 
 /// Every automatic announcement, in the order they normally play.

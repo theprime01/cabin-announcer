@@ -12,7 +12,7 @@ use crate::announcer::{self, Live, Outcome};
 use crate::audio::{Audio, View};
 use crate::config::Config;
 use crate::packs;
-use crate::phase::{Cue, Director, DoorState, Gsx, Phase, Telemetry};
+use crate::phase::{Cue, Director, DoorState, GSX_PERFORMING, Gsx, Phase, Telemetry};
 use crate::pmdg::{self, Belts, Doors, PmdgData};
 use crate::simconnect::{DATATYPE_FLOAT64, DATATYPE_STRING256, PERIOD_SECOND, Recv, SimConnect};
 
@@ -315,9 +315,10 @@ struct Background {
 }
 
 impl Background {
-    fn update(&mut self, audio: &Audio, phase: Phase, pack: Option<&packs::Pack>, config: &Config) {
+    fn update(&mut self, audio: &Audio, phase: Phase, gsx: Gsx, pack: Option<&packs::Pack>, config: &Config) {
         let tracks = |folder| packs::background(folder, announcer::source_for(folder, pack, config).as_ref());
-        let music = if phase.boarding_music() { tracks(BOARDING_MUSIC) } else { Vec::new() };
+        // Boarding music only while GSX is boarding passengers.
+        let music = if gsx.boarding == GSX_PERFORMING { tracks(BOARDING_MUSIC) } else { Vec::new() };
         let cabin = matches!(
             phase,
             Phase::DoorsClosed | Phase::Pushback | Phase::TaxiOut | Phase::TakeoffRoll | Phase::Climb | Phase::Cruise | Phase::Descent | Phase::Approach | Phase::Rollout | Phase::TaxiIn
@@ -440,7 +441,7 @@ fn session(sc: &SimConnect, state: &Mutex<State>, config: &Mutex<Config>, audio:
                         s.log(msg);
                     }
                     let pack = announcer::pack_in_use(&cfg, &live);
-                    background.update(audio, director.phase(), pack.as_ref(), &cfg);
+                    background.update(audio, director.phase(), gsx, pack.as_ref(), &cfg);
                     s.phase = director.phase();
                     s.telemetry = t;
                     s.live = live.clone();

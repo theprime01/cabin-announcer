@@ -328,15 +328,25 @@ impl Layer {
             }
         }
         let target = if wanted { target } else { 0.0 };
-        // About a two-second fade at 20 ticks a second.
-        let step = 0.025f32.max((target - self.level).abs() * 0.08);
+        // Fades in over about two seconds; fades out within a third of a second,
+        // so an announcement never starts over the music.
+        let step = if target < self.level { 0.06f32 } else { 0.025f32.max((target - self.level).abs() * 0.08) };
         self.level = if self.level < target { (self.level + step).min(target) } else { (self.level - step).max(target) };
         self.sink.set_volume(self.level);
         if !wanted && self.level <= 0.0 && !self.sink.empty() {
             self.sink.clear();
             self.sink.play();
             self.now = None;
+        } else if wanted && self.level <= 0.0 && target <= 0.0 {
+            // Held for an announcement: pause so the track carries on where it left off.
+            self.sink.pause();
+        } else if target > 0.0 && self.sink.is_paused() {
+            self.sink.play();
         }
+    }
+
+    fn silent(&self) -> bool {
+        self.level <= 0.0 || self.tracks.is_empty()
     }
 }
 
@@ -438,7 +448,9 @@ fn run(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, mut sound: Sound) {
             // A short gap between back-to-back announcements.
             gap_until = Instant::now() + Duration::from_millis(800);
         }
-        if speech.empty() && !paused && Instant::now() >= gap_until {
+        // Music stops for announcements and comes back a moment after the last one.
+        let speaking = !speech.empty() || !queue.is_empty() || Instant::now() < gap_until + Duration::from_millis(1500);
+        if speech.empty() && !paused && Instant::now() >= gap_until && music.silent() {
             if let Some(item) = queue.pop_front() {
                 speech.set_volume(sound.volume.clamp(0.0, 1.0));
                 match build(&item, &sound, &muffle, &speech) {
@@ -454,10 +466,9 @@ fn run(rx: Receiver<Msg>, status: Arc<Mutex<Status>>, mut sound: Sound) {
                 }
             }
         }
-        // Background sound dips under announcements.
-        let duck = if speech.empty() { 1.0 } else { 0.25 };
-        let music_target = if sound.music { sound.music_volume * duck } else { 0.0 };
-        let ambience_target = if sound.ambience { sound.ambience_volume * duck.max(0.6) } else { 0.0 };
+        let music_target = if sound.music && !speaking { sound.music_volume } else { 0.0 };
+        // Ambience is the cabin itself, so it only dips.
+        let ambience_target = if sound.ambience { sound.ambience_volume * if speaking { 0.6 } else { 1.0 } } else { 0.0 };
         if !paused {
             music.tick(music_target, &muffle, &mut error);
             ambience.tick(ambience_target, &muffle, &mut error);
@@ -497,6 +508,77 @@ mod tests {
         let c = chime(44_100);
         assert!(c.len() > 88_000);
         assert!(c[c.len() - 1].abs() < 0.05);
+    }
+
+    /// A silent 16-bit mono WAV file, long enough to keep playing during the test.
+    fn silent_wav(path: &std::path::Path, secs: u32) {
+        let rate = 8000u32;
+        let data = rate * 2 * secs;
+        let mut b = Vec::new();
+        b.extend(b"RIFF");
+        b.extend((36 + data).to_le_bytes());
+        b.extend(b"WAVEfmt ");
+        b.extend(16u32.to_le_bytes());
+        b.extend(1u16.to_le_bytes());
+        b.extend(1u16.to_le_bytes());
+        b.extend(rate.to_le_bytes());
+        b.extend((rate * 2).to_le_bytes());
+        b.extend(2u16.to_le_bytes());
+        b.extend(16u16.to_le_bytes());
+        b.extend(b"data");
+        b.extend(data.to_le_bytes());
+        b.resize(b.len() + data as usize, 0);
+        std::fs::write(path, b).unwrap();
+    }
+
+    #[test]
+    fn music_fades_out_fast_and_pauses_for_announcements() {
+        let path = std::env::temp_dir().join(format!("ca-music-{}.wav", std::process::id()));
+        silent_wav(&path, 30);
+        let (sink, mut out) = Sink::new_idle();
+        // Stands in for the sound card: reads samples at about real time.
+        // (Sink::clear waits for the output to catch up, so something must read.)
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..80 {
+                        out.next();
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            })
+        };
+        let mut music = Layer { sink, tracks: vec![path.clone()], level: 0.0, now: None };
+        let muffle = Arc::new(Muffle::default());
+        let mut err = None;
+        for _ in 0..60 {
+            music.tick(0.35, &muffle, &mut err);
+        }
+        assert!(err.is_none(), "{err:?}");
+        assert!((music.level - 0.35).abs() < 1e-6);
+        // An announcement comes in: silent within a third of a second (7 ticks).
+        let mut ticks = 0;
+        while !music.silent() {
+            music.tick(0.0, &muffle, &mut err);
+            ticks += 1;
+        }
+        assert!(ticks <= 7, "took {ticks} ticks");
+        music.tick(0.0, &muffle, &mut err);
+        assert!(music.sink.is_paused(), "held, not stopped");
+        assert_eq!(music.sink.len(), 1, "same track kept");
+        music.tick(0.35, &muffle, &mut err);
+        assert!(!music.sink.is_paused());
+        // GSX boarding ends: the track is dropped once faded out.
+        music.tracks.clear();
+        for _ in 0..10 {
+            music.tick(0.35, &muffle, &mut err);
+        }
+        assert!(music.sink.empty() && music.now.is_none());
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+        let _ = std::fs::remove_file(&path);
     }
 
     fn rms(v: &[f32]) -> f32 {
